@@ -31,6 +31,7 @@ dependencies = [
   "pyarrow==25.0.0",
   "pymongo>=4.17,<4.19",
   "pymongoarrow>=1.15,<1.16",
+  "python-socks>=2.7,<3",
   "singer-sdk>=0.55.0b7",
 ]
 [[project.maintainers]]

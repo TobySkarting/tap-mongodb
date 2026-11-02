@@ -116,6 +116,22 @@ class TapMongoDB(Tap):
             ),
         ),
         th.Property(
+            "incremental_field",
+            th.StringType,
+            required=False,
+            description=(
+                "Document field (a BSON date, such as `updatedAt`) to use for incremental replication instead of the "
+                "`_id` creation time, so that updated documents are re-extracted. Documents without this field are "
+                "not extracted. Not supported with the Arrow batch format."
+            ),
+        ),
+        th.Property(
+            "incremental_field_overrides",
+            th.ObjectType(),
+            required=False,
+            description="Per-collection `incremental_field`, as a mapping of collection name to field name.",
+        ),
+        th.Property(
             "add_record_metadata",
             th.BooleanType,
             required=False,

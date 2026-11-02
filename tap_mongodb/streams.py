@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from bson.objectid import ObjectId
 from pymongo import ASCENDING
 from pymongo.errors import OperationFailure
 from singer_sdk import Tap
@@ -25,7 +26,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator, Iterable, Mapping
 
     import pyarrow as pa
-    from bson.objectid import ObjectId
     from pymongo.collection import Collection
     from pymongo.database import Database
     from pymongo.typings import _DocumentType
@@ -272,6 +272,9 @@ class MongoDBCollectionStream(Stream):
         """
         if self.replication_method != REPLICATION_INCREMENTAL:
             return None
+        if self.incremental_field:
+            msg = "incremental_field is not supported with the Arrow batch format"
+            raise ValueError(msg)
 
         bookmark: str | None = self.get_starting_replication_key_value(context)
         start = to_object_id(bookmark or self.config.get("start_date", DEFAULT_START_DATE))
@@ -284,6 +287,73 @@ class MongoDBCollectionStream(Stream):
         if self.is_flat_layout:
             extractor.declared, extractor.deselected = self._selected_declared_fields()
         return extractor.tables(start)
+
+    @property
+    def incremental_field(self) -> str | None:
+        """The document field used for incremental replication, or None to use the `_id` creation time."""
+        overrides: dict = self.config.get("incremental_field_overrides") or {}
+        return overrides.get(self._collection_name, self.config.get("incremental_field"))
+
+    def _get_records_by_field(
+        self, collection: Collection, bookmark: str | None, *, should_add_metadata: bool
+    ) -> Iterable[dict]:
+        """Yield documents ordered by (incremental_field, _id), starting after the bookmark.
+
+        The replication key is `<field value as ISO-8601 with microseconds, UTC>|<_id>`, which sorts the same way as
+        the query, so an interrupted sync resumes where it stopped and a document is re-extracted whenever the field
+        moves forward (for example `updatedAt` on every save).
+        """
+        field = self.incremental_field
+        if bookmark:
+            bookmark_dt, _, bookmark_oid = bookmark.partition("|")
+            start = datetime.fromisoformat(bookmark_dt).astimezone(timezone.utc).replace(tzinfo=None)
+            if bookmark_oid:
+                query = {
+                    "$or": [
+                        {field: {"$gt": start}},
+                        {field: start, "_id": {"$gt": ObjectId(bookmark_oid)}},
+                    ]
+                }
+            else:
+                query = {field: {"$gt": start}}
+        else:
+            start_date_str = str(self.config.get("start_date", DEFAULT_START_DATE))
+            start = datetime.fromisoformat(start_date_str.replace("Z", "+00:00"))
+            if start.tzinfo is not None:
+                start = start.astimezone(timezone.utc).replace(tzinfo=None)
+            query = {field: {"$gte": start}}
+        self.logger.info("incremental field: %s, query: %s", field, query)
+
+        for record in collection.find(query).sort([(field, ASCENDING), ("_id", ASCENDING)]):
+            value = record.get(field)
+            if isinstance(value, str):
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            elif not isinstance(value, datetime):
+                value = getattr(value, "as_datetime", lambda: None)()
+            if value is None:
+                msg = f"Document {record['_id']} in {collection.name} has no usable {field} value"
+                raise ValueError(msg)
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            value = value.astimezone(timezone.utc)
+            object_id = record["_id"]
+
+            recursive_replace_empty_in_dict(record)
+
+            parsed_record = {
+                "replication_key": f"{value.strftime('%Y-%m-%dT%H:%M:%S.%f')}+00:00|{object_id}",
+                "object_id": str(object_id),
+                "document": record,
+                "operation_type": None,
+                "cluster_time": None,
+                "namespace": {
+                    "database": collection.database.name,
+                    "collection": collection.name,
+                },
+            }
+            if should_add_metadata:
+                parsed_record["_sdc_batched_at"] = datetime.now(timezone.utc)
+            yield parsed_record
 
     def get_records(self, context: dict | None) -> Iterable[dict]:
         """Return a generator of record-type dictionary objects."""
@@ -300,6 +370,10 @@ class MongoDBCollectionStream(Stream):
             context,
         )
         self.logger.info("state: %s", self.get_context_state(context))
+
+        if self.replication_method == REPLICATION_INCREMENTAL and self.incremental_field:
+            yield from self._get_records_by_field(collection, bookmark, should_add_metadata=should_add_metadata)
+            return
 
         if self.replication_method == REPLICATION_INCREMENTAL:
             if bookmark:
